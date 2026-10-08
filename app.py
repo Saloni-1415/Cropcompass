@@ -5,6 +5,8 @@ import base64
 import os
 import sqlite3
 from datetime import datetime
+import hashlib
+import secrets
 
 from sklearn.pipeline import Pipeline
 
@@ -221,6 +223,67 @@ h3 {
     color: #ffffff;
 }
 
+
+/* =========================================================
+   AUTHENTICATION
+========================================================= */
+
+.auth-shell {
+    max-width: 720px;
+    margin: 55px auto 28px auto;
+    text-align: center;
+    padding: 38px 30px;
+    background: rgba(255,255,255,.82);
+    border: 1px solid var(--line);
+    border-radius: 24px;
+    box-shadow: 0 22px 55px -30px rgba(20,64,43,.35);
+}
+
+.auth-logo {
+    font-size: 48px;
+    margin-bottom: 8px;
+}
+
+.auth-title {
+    color: var(--green-800);
+    font-size: 38px;
+    font-weight: 800;
+    letter-spacing: -1.2px;
+}
+
+.auth-subtitle {
+    color: var(--muted);
+    margin-top: 8px;
+    font-size: 15px;
+}
+
+/* =========================================================
+   SIDEBAR USER
+========================================================= */
+
+.sidebar-user {
+    margin: 0 6px 12px 6px;
+    padding: 12px 13px;
+    border: 1px solid rgba(255,255,255,.10);
+    border-radius: 12px;
+    background: rgba(255,255,255,.06);
+}
+
+.sidebar-user-label {
+    color: #7fa28d !important;
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 1.2px;
+}
+
+.sidebar-user-name {
+    color: #ffffff !important;
+    font-size: 14px;
+    font-weight: 700;
+    margin-top: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
 
 /* =========================================================
    SIDEBAR BRAND
@@ -2572,7 +2635,142 @@ def initialize_database():
 initialize_database()
 
 
+# =========================================================
+# USER AUTHENTICATION
+# =========================================================
+
+def initialize_user_database():
+
+    connection = sqlite3.connect(DATABASE_PATH)
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            created_at TEXT
+        )
+        """
+    )
+
+    # Add user_id to older prediction_history databases.
+    cursor.execute("PRAGMA table_info(prediction_history)")
+    columns = [row[1] for row in cursor.fetchall()]
+
+    if "user_id" not in columns:
+        cursor.execute(
+            "ALTER TABLE prediction_history ADD COLUMN user_id INTEGER"
+        )
+
+    connection.commit()
+    connection.close()
+
+
+initialize_user_database()
+
+
+def hash_password(password, salt=None):
+
+    if salt is None:
+        salt = secrets.token_hex(16)
+
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        100000
+    )
+
+    return password_hash.hex(), salt
+
+
+def verify_password(password, stored_hash, salt):
+
+    password_hash, _ = hash_password(password, salt)
+
+    return secrets.compare_digest(
+        password_hash,
+        stored_hash
+    )
+
+
+def create_user(name, email, password):
+
+    password_hash, salt = hash_password(password)
+
+    connection = sqlite3.connect(DATABASE_PATH)
+    cursor = connection.cursor()
+
+    try:
+
+        cursor.execute(
+            """
+            INSERT INTO users (
+                name,
+                email,
+                password_hash,
+                salt,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                name,
+                email.strip().lower(),
+                password_hash,
+                salt,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
+        )
+
+        connection.commit()
+        return True, "Account created successfully."
+
+    except sqlite3.IntegrityError:
+        return False, "An account with this email already exists."
+
+    finally:
+        connection.close()
+
+
+def authenticate_user(email, password):
+
+    connection = sqlite3.connect(DATABASE_PATH)
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT id, name, email, password_hash, salt
+        FROM users
+        WHERE email = ?
+        """,
+        (email.strip().lower(),)
+    )
+
+    user = cursor.fetchone()
+    connection.close()
+
+    if user is None:
+        return None
+
+    user_id, name, email, stored_hash, salt = user
+
+    if verify_password(password, stored_hash, salt):
+        return {
+            "id": user_id,
+            "name": name,
+            "email": email
+        }
+
+    return None
+
+
 def save_prediction(
+    user_id,
     nitrogen,
     phosphorus,
     potassium,
@@ -2595,6 +2793,7 @@ def save_prediction(
         """
         INSERT INTO prediction_history (
 
+            user_id,
             timestamp,
 
             nitrogen,
@@ -2614,10 +2813,12 @@ def save_prediction(
 
         )
 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
 
         (
+
+            user_id,
 
             datetime.now().strftime(
                 "%Y-%m-%d %H:%M:%S"
@@ -2646,7 +2847,7 @@ def save_prediction(
     connection.close()
 
 
-def load_prediction_history():
+def load_prediction_history(user_id):
 
     connection = sqlite3.connect(
         DATABASE_PATH
@@ -2668,9 +2869,11 @@ def load_prediction_history():
             logistic_prediction AS "Logistic Regression",
             model_score AS "RF Score"
         FROM prediction_history
+        WHERE user_id = ?
         ORDER BY id DESC
         """,
-        connection
+        connection,
+        params=(user_id,)
     )
 
     connection.close()
@@ -2718,8 +2921,135 @@ dataset = load_dataset()
 
 
 # =========================================================
+# AUTHENTICATION
+# =========================================================
+
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+
+if not st.session_state.logged_in:
+
+    st.markdown(
+        """
+        <div class="auth-shell">
+            <div class="auth-logo">🌱</div>
+            <div class="auth-title">CropCompass</div>
+            <div class="auth-subtitle">
+                Machine Learning-Based Crop Decision Support
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    login_tab, signup_tab = st.tabs(["🔐 Login", "📝 Sign Up"])
+
+    with login_tab:
+
+        st.markdown("### Welcome back")
+        st.caption("Login to access your CropCompass dashboard and prediction history.")
+
+        with st.form("login_form"):
+
+            login_email = st.text_input("Email", placeholder="you@example.com")
+            login_password = st.text_input("Password", type="password")
+
+            login_button = st.form_submit_button(
+                "Login",
+                use_container_width=True
+            )
+
+            if login_button:
+
+                if not login_email or not login_password:
+                    st.error("Please enter your email and password.")
+
+                else:
+                    user = authenticate_user(
+                        login_email,
+                        login_password
+                    )
+
+                    if user:
+                        st.session_state.logged_in = True
+                        st.session_state.user = user
+                        st.rerun()
+
+                    else:
+                        st.error("Invalid email or password.")
+
+    with signup_tab:
+
+        st.markdown("### Create your account")
+        st.caption("Create an account to keep your prediction history private to you.")
+
+        with st.form("signup_form"):
+
+            signup_name = st.text_input("Full Name")
+            signup_email = st.text_input("Email", placeholder="you@example.com")
+            signup_password = st.text_input("Password", type="password")
+            signup_confirm_password = st.text_input(
+                "Confirm Password",
+                type="password"
+            )
+
+            signup_button = st.form_submit_button(
+                "Create Account",
+                use_container_width=True
+            )
+
+            if signup_button:
+
+                if not signup_name.strip() or not signup_email.strip():
+                    st.error("Please fill in your name and email.")
+
+                elif not signup_password:
+                    st.error("Please enter a password.")
+
+                elif signup_password != signup_confirm_password:
+                    st.error("Passwords do not match.")
+
+                elif len(signup_password) < 6:
+                    st.error("Password must contain at least 6 characters.")
+
+                else:
+                    success, message = create_user(
+                        signup_name.strip(),
+                        signup_email.strip(),
+                        signup_password
+                    )
+
+                    if success:
+                        st.success("Account created successfully. Please login.")
+                    else:
+                        st.error(message)
+
+    st.stop()
+
+
+# =========================================================
 # SIDEBAR
 # =========================================================
+
+st.sidebar.markdown(
+    f"""
+<div class="sidebar-user">
+    <div class="sidebar-user-label">SIGNED IN AS</div>
+    <div class="sidebar-user-name">👋 {st.session_state.user["name"]}</div>
+</div>
+""",
+    unsafe_allow_html=True
+)
+
+if st.sidebar.button("🚪 Logout", use_container_width=True):
+    st.session_state.logged_in = False
+    st.session_state.user = None
+    st.rerun()
+
 
 st.sidebar.markdown(
     """
@@ -3240,6 +3570,8 @@ elif page == "🌾 Crop Prediction":
         # SAVE TO DATABASE
 
         save_prediction(
+
+            st.session_state.user["id"],
 
             nitrogen,
             phosphorus,
@@ -4533,7 +4865,7 @@ elif page == "📜 Prediction History":
     )
 
 
-    history_df = load_prediction_history()
+    history_df = load_prediction_history(st.session_state.user["id"])
 
 
     if history_df.empty:
